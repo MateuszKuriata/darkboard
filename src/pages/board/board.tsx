@@ -12,7 +12,6 @@ import {
   ExcalidrawInitialDataState,
 } from '@excalidraw/excalidraw/types/types'
 import { ExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
-import { debounce } from 'lodash'
 import { Socket } from 'net'
 import { WebsocketContext, WebsocketContextType } from '../../providers/websocketProvider'
 import useBoardRoom from '../../hooks/useBoardRoom'
@@ -35,13 +34,25 @@ type Props = ExcalidrawInitialDataState & {
 export function Board({ elements, appState, user, socket, instanceId }: Props) {
   const { updateDocField } = useFirestore()
   const [excalidrawAPI, excalidrawRefCallback] = useCallbackRefState<ExcalidrawImperativeAPI>()
-  const oldElementsMap = new Map(elements?.map((e) => [e.id, e]))
+  const oldElementsMap = new Map(elements?.map((e) => [e.id, e.version]))
 
   useEffect(() => {
     if (excalidrawAPI && socket) {
-      socket.on('client-change', (elements) => {
-        elements.forEach((e: ExcalidrawElement) => oldElementsMap.set(e.id, e))
-        excalidrawAPI?.updateScene({ elements: Array.from(oldElementsMap.values()) })
+      socket.on('client-change', (elements: ExcalidrawElement[]) => {
+        const newMap = new Map(
+          excalidrawAPI.getSceneElementsIncludingDeleted()?.map((e) => [e.id, e]),
+        )
+        const diffs: ExcalidrawElement[] = []
+
+        elements.forEach((element: ExcalidrawElement) => {
+          if (oldElementsMap.get(element.id) !== element.version) {
+            diffs.push(element)
+            newMap.set(element.id, { ...element })
+            oldElementsMap.set(element.id, element.version)
+          }
+        })
+
+        if (diffs.length) excalidrawAPI?.updateScene({ elements: Array.from(newMap.values()) })
       })
 
       onValue(ref(rdb, `pointer-update/${instanceId}`), (snapshot) => {
@@ -60,10 +71,10 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
   const onChange = (elements: readonly ExcalidrawElement[]) => {
     const diffs: ExcalidrawElement[] = []
 
-    elements.forEach((element) => {
-      if (oldElementsMap.get(element.id)?.version !== element.version) {
+    elements.forEach((element: ExcalidrawElement) => {
+      if (oldElementsMap.get(element.id) !== element.version) {
         diffs.push(element)
-        oldElementsMap.set(element.id, { ...element })
+        oldElementsMap.set(element.id, element.version)
       }
     })
 
@@ -86,7 +97,7 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
         data: { elements: serializedElements },
         id: instanceId,
       })
-      socket.emit('server-change', diffs, instanceId)
+      socket.emit('server-change', diffs, instanceId, user?.id)
     }
   }
 
@@ -114,9 +125,7 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
           appState,
         }}
         onChange={(elements) => {
-          debounce(() => {
-            onChange(elements)
-          }, 100)()
+          onChange(elements)
         }}
         onPointerUpdate={(payload) => onPointerChange(payload)}
         renderTopRightUI={() => <ShareButton id={instanceId} />}
