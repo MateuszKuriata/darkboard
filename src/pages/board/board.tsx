@@ -3,7 +3,7 @@ import '@tldraw/tldraw/editor.css'
 import '@tldraw/tldraw/ui.css'
 import { useEffect, useState, useCallback, useContext } from 'react'
 import useFirestore from '../../hooks/useFirestore'
-import {Box, LinearProgress, Stack, Typography, useTheme} from '@mui/material'
+import { Box, LinearProgress, Stack, Typography, useTheme } from '@mui/material'
 import { useParams } from 'react-router-dom'
 import { Excalidraw, MainMenu } from '@excalidraw/excalidraw'
 import { ref, onValue, update, onDisconnect } from 'firebase/database'
@@ -15,9 +15,10 @@ import { ExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
 import { Socket } from 'net'
 import { WebsocketContext, WebsocketContextType } from '../../providers/websocketProvider'
 import useBoardRoom from '../../hooks/useBoardRoom'
-import { FirebaseUserContextType, useUserContext } from '../../providers/firebaseUserProvider'
+import { UserEntity, useUserContext } from '../../providers/firebaseUserProvider'
 import { rdb } from '../../config/firebase'
 import ShareButton from './components/shareButton/shareButton'
+import { serializeExcToFbase } from '../../shared/utils'
 
 export function useCallbackRefState<T>() {
   const [refValue, setRefValue] = useState<T | null>(null)
@@ -25,47 +26,53 @@ export function useCallbackRefState<T>() {
   return [refValue, refCallback] as const
 }
 
+const baseExcalidrawElement = {
+  groupIds: [],
+}
+
 type Props = ExcalidrawInitialDataState & {
   socket: Socket
-  user: FirebaseUserContextType['user']
+  user: UserEntity
   instanceId: string
 }
 
 export function Board({ elements, appState, user, socket, instanceId }: Props) {
-  const theme = useTheme();
-
+  const theme = useTheme()
   const { updateDocField } = useFirestore()
   const [excalidrawAPI, excalidrawRefCallback] = useCallbackRefState<ExcalidrawImperativeAPI>()
   const oldElementsMap = new Map(elements?.map((e) => [e.id, e.version]))
 
   useEffect(() => {
     if (excalidrawAPI && socket) {
-      socket.on('client-change', (elements: ExcalidrawElement[]) => {
-        const newMap = new Map(
-          excalidrawAPI.getSceneElementsIncludingDeleted()?.map((e) => [e.id, e]),
-        )
-        const diffs: ExcalidrawElement[] = []
+      onValue(ref(rdb, `pointer-update/${instanceId}`), (snapshot) => {
+        const data = snapshot.val() || {}
+        delete data[user?.id]
 
-        elements.forEach((element: ExcalidrawElement) => {
-          if (oldElementsMap.get(element.id) !== element.version) {
-            diffs.push(element)
-            newMap.set(element.id, { ...element })
-            oldElementsMap.set(element.id, element.version)
-          }
+        excalidrawAPI?.updateScene({
+          collaborators: new Map(Object.entries(data)),
         })
-
-        if (diffs.length) excalidrawAPI?.updateScene({ elements: Array.from(newMap.values()) })
+        onDisconnect(ref(rdb, `pointer-update/${instanceId}/${user.id}`)).remove()
       })
 
-      onValue(ref(rdb, `pointer-update/${instanceId}`), (snapshot) => {
-        if (user) {
-          const data = snapshot.val() || {}
-          delete data[user?.id]
+      onValue(ref(rdb, `board-update/${instanceId}`), (snapshot) => {
+        const { elements: newElements } = snapshot.val() || {}
+        if (newElements) {
+          const newMap = new Map(
+            excalidrawAPI.getSceneElementsIncludingDeleted()?.map((e) => [e.id, e]),
+          )
+          const diffs: ExcalidrawElement[] = []
 
-          excalidrawAPI?.updateScene({ collaborators: new Map(Object.entries(data)) })
-          const myConnectionsRef = ref(rdb, `pointer-update/${instanceId}/${user.id}`)
-          onDisconnect(myConnectionsRef).remove()
+          newElements.forEach((element: ExcalidrawElement) => {
+            if (oldElementsMap.get(element.id) !== element.version) {
+              diffs.push(element)
+              newMap.set(element.id, { ...baseExcalidrawElement, ...element })
+              oldElementsMap.set(element.id, element.version)
+            }
+          })
+
+          if (diffs.length) excalidrawAPI?.updateScene({ elements: Array.from(newMap.values()) })
         }
+        onDisconnect(ref(rdb, `board-update/${instanceId}`)).remove()
       })
     }
   }, [excalidrawAPI])
@@ -81,25 +88,14 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
     })
 
     if (diffs.length > 0) {
-      const serializedElements = [...elements].map((element) => {
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-ignore
-        const points = element?.points
-
-        if (points) {
-          return {
-            ...element,
-            points: JSON.stringify(points),
-          }
-        } else return element
-      })
+      const serializedElements = serializeExcToFbase(elements)
 
       updateDocField({
         collectionId: 'boardsContent',
         data: { elements: serializedElements },
         id: instanceId,
       })
-      socket.emit('server-change', diffs, instanceId, user?.id)
+      update(ref(rdb, `board-update/${instanceId}`), { elements: diffs })
     }
   }
 
@@ -108,13 +104,17 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
     button,
   }: {
     pointer: { x: number; y: number }
+    pointersMap: Map<number, Readonly<{ x: number; y: number }>>
     button: 'down' | 'up'
   }) => {
-    if (user) {
-      update(ref(rdb, `pointer-update/${instanceId}`), {
-        [`${user?.id}`]: { pointer, button, username: user?.firstName || '', id: user?.id },
-      })
-    }
+    update(ref(rdb, `pointer-update/${instanceId}`), {
+      [`${user?.id}`]: {
+        pointer,
+        button,
+        username: user?.firstName || '',
+        id: user?.id,
+      },
+    })
   }
 
   return (
@@ -123,14 +123,9 @@ export function Board({ elements, appState, user, socket, instanceId }: Props) {
         theme={theme.palette.mode}
         autoFocus
         ref={(api) => excalidrawRefCallback(api as ExcalidrawImperativeAPI)}
-        initialData={{
-          elements,
-          appState,
-        }}
-        onChange={(elements) => {
-          onChange(elements)
-        }}
-        onPointerUpdate={(payload) => onPointerChange(payload)}
+        initialData={{ elements, appState }}
+        onChange={(elements) => onChange(elements)}
+        onPointerUpdate={onPointerChange}
         renderTopRightUI={() => <ShareButton id={instanceId} />}
       >
         <MainMenu>
@@ -179,7 +174,7 @@ const LoadBoard = () => {
     })
   }, [])
 
-  return elements && socket ? (
+  return elements && socket && user ? (
     <Board
       instanceId={instanceId}
       elements={elements}
